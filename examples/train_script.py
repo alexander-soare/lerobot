@@ -453,7 +453,8 @@ class DiffusionModel(nn.Module):
 
         img_features = self.rgb_encoder(einops.rearrange(batch["observation.image"], "b n ... -> (b n) ..."))
         print('____________ After RGB encoder:  ____________', img_features)
-        breakpoint()
+        if torch.any(torch.isnan(img_features)):
+            breakpoint()
         # Separate batch and sequence dims.
         img_features = einops.rearrange(img_features, "(b n) ... -> b n ...", b=batch_size)
         # Concatenate state and image features then flatten to (B, global_cond_dim).
@@ -1144,7 +1145,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             self.episode_data_index = calculate_episode_data_index_for_custom_dataset(self.hf_dataset)
         
         
-        safe_tensors_path = 'lerobot/examples/stats.safetensors'
+        safe_tensors_path = 'examples/stats.safetensors'
         self.stats = load_stats(repo_id, version, root=safe_tensors_path)
 
     @property
@@ -1290,7 +1291,7 @@ if __name__ == '__main__':
         "observation.state": [0.1, 0.0, 0.1, 0.5],
         "action": [-0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4],
     }
-    dataset = LeRobotDataset(repo_id, delta_timestamps=delta_timestamps, root='lerobot/examples/dataset.parquet')
+    dataset = LeRobotDataset(repo_id, delta_timestamps=delta_timestamps, root='examples/dataset.parquet')
     print(dataset)
     print(dataset.hf_dataset)
     
