@@ -410,9 +410,10 @@ def _compile_episode_data(
     total_frames = 0
     for ep_ix in range(rollout_data["action"].shape[0]):
         num_frames = done_indices[ep_ix].item() + 1  # + 1 to include the first done frame
-        total_frames += num_frames
+        # + 1 to include the last observation
+        total_frames += num_frames + 1
 
-        # TODO(rcadene): We need to add a missing last frame which is the observation
+        # TODO(now): We need to add a missing last frame which is the observation
         # of a done state. it is critical to have this frame for tdmpc to predict a "done observation/state"
         ep_dict = {
             "action": rollout_data["action"][ep_ix, :num_frames],
@@ -423,8 +424,14 @@ def _compile_episode_data(
             "next.success": rollout_data["success"][ep_ix, :num_frames],
             "next.reward": rollout_data["reward"][ep_ix, :num_frames].type(torch.float32),
         }
+
+        # TODO(now): tidy up
+        for k in ep_dict:
+            ep_dict[k] = torch.cat([ep_dict[k], ep_dict[k][-1:]])
+
         for key in rollout_data["observation"]:
-            ep_dict[key] = rollout_data["observation"][key][ep_ix][:num_frames]
+            ep_dict[key] = rollout_data["observation"][key][ep_ix][: num_frames + 1]
+
         ep_dicts.append(ep_dict)
 
     data_dict = {}
