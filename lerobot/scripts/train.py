@@ -484,12 +484,11 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
     sampler = torch.utils.data.WeightedRandomSampler(
         weights, num_samples=len(concat_dataset), replacement=True
     )
-    # Note: This does not use multiple workers as the prefetching mechanism doesn't work well with a dataset
-    # that keeps changing size. This can be potentially worked around in future revisions.
+    # TODO(now): Add a way of verifying that num_workers == 0 if async rollouts.
     dataloader = torch.utils.data.DataLoader(
         concat_dataset,
         batch_size=cfg.training.batch_size,
-        num_workers=4,
+        num_workers=cfg.training.num_workers,
         sampler=sampler,
         pin_memory=device.type != "cpu",
         drop_last=True,
