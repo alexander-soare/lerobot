@@ -43,8 +43,8 @@ class OnlineBuffer(torch.utils.data.Dataset):
     def __init__(
         self,
         write_dir: str | Path,
-        data_shapes: dict[str, tuple[int, ...]] | None = None,
-        buffer_capacity: int | None = None,
+        data_spec: dict[str, Any] | None,
+        buffer_capacity: int | None,
         fps: float | None = None,
         delta_timestamps: dict[str, list[float]] | dict[str, np.ndarray] | None = None,
     ):
@@ -56,13 +56,12 @@ class OnlineBuffer(torch.utils.data.Dataset):
             write_dir: Where to keep the numpy memmap files. One memmap file will be stored for each data key.
                 Note that if the files already exist, they are opened in read-write mode (used for training
                 resumption.)
-            data_shapes: A mapping from data key to data tensor shape. This should include all the data that
-                you wish to record into the buffer, but note that "index", "frame_index" and "episode_index"
-                are already accounted for by this class, so you don't need to pass their shapes. You can pass
-                None if you are loading an existing buffer.
+            data_spec: A mapping from data key to data specification, like {data_key: {"shape": tuple[int],
+                "dtype": np.dtype}}. This should include all the data that you wish to record into the buffer,
+                but note that "index", "frame_index" and "episode_index" are already accounted for by this
+                class, so you don't need to include them.
             buffer_capacity: How many frames should be stored in the buffer as a maximum. Be aware of your
-                system's available disk space when choosing this. You can pass None if you are loading an
-                existing buffer.
+                system's available disk space when choosing this.
             fps: Same as the fps concept in LeRobot dataset. Here it needs to be provided for the
                  delta_timestamps logic. You can pass None if you are not using delta_timestamps.
             delta_timestamps: Same as the delta_timestamps concept in LeRobotDataset. This is internally
@@ -70,51 +69,48 @@ class OnlineBuffer(torch.utils.data.Dataset):
 
         """
         super().__init__()
-        self.delta_timestamps = delta_timestamps
+        self.set_delta_timestamps(delta_timestamps)
         self._fps = fps
         self._buffer_capacity = buffer_capacity
-        if data_shapes is not None:
-            data_spec = self._make_data_spec(data_shapes, buffer_capacity)
-        else:
-            # Make a dummy data_spec with just the keys.
-            data_spec = {fn: None for fn in os.listdir(write_dir)}
-        os.makedirs(write_dir, exist_ok=True)
-        self._data = {
-            k: _make_memmap_safe(
+        data_spec = self._make_data_spec(data_spec, buffer_capacity)
+        Path(write_dir).mkdir(parents=True, exist_ok=True)
+        self._data = {}
+        for k, v in data_spec.items():
+            self._data[k] = _make_memmap_safe(
                 filename=Path(write_dir) / k,
                 dtype=v["dtype"] if v is not None else None,
                 mode="r+" if (Path(write_dir) / k).exists() else "w+",
                 shape=tuple(v["shape"]) if v is not None else None,
             )
-            for k, v in data_spec.items()
-        }
 
     @property
     def delta_timestamps(self) -> dict[str, np.ndarray] | None:
         return self._delta_timestamps
 
-    @delta_timestamps.setter
-    def delta_timestamps(self, value: dict[str, list[float]] | dict[str, np.ndarray] | None):
+    def set_delta_timestamps(self, value: dict[str, list[float]] | None):
+        """Set delta_timestamps converting the values to numpy arrays.
+
+        The conversion is for an optimization in the __getitem__. The loop is much slower if the arrays
+        need to be converted into numpy arrays.
+        """
         if value is not None:
             self._delta_timestamps = {k: np.array(v) for k, v in value.items()}
         else:
             self._delta_timestamps = None
 
-    def _make_data_spec(
-        self, data_shapes: dict[str, tuple[int, ...]], buffer_capacity: int
-    ) -> dict[str, dict[str, Any]]:
+    def _make_data_spec(self, data_spec: dict[str, Any], buffer_capacity: int) -> dict[str, dict[str, Any]]:
         """Makes the data spec for np.memmap."""
-        if any(k.startswith("_") for k in data_shapes):
+        if any(k.startswith("_") for k in data_spec):
             raise ValueError(
-                "data_shapes keys should not start with '_'. This prefix is reserved for internal logic."
+                "data_spec keys should not start with '_'. This prefix is reserved for internal logic."
             )
         preset_keys = {"index", "frame_index", "episode_index", "timestamp"}
-        if len(intersection := set(data_shapes).intersection(preset_keys)) > 0:
+        if len(intersection := set(data_spec).intersection(preset_keys)) > 0:
             raise ValueError(
-                f"data_shapes should not contain any of {preset_keys} as these are handled internally. "
-                f"The provided data_shapes has {intersection}."
+                f"data_spec should not contain any of {preset_keys} as these are handled internally. "
+                f"The provided data_spec has {intersection}."
             )
-        data_spec = {
+        complete_data_spec = {
             # _next_index will be a pointer to the next index that we should start filling from when we add
             # more data.
             "_next_index": {"dtype": np.dtype("int64"), "shape": (1,)},
@@ -125,15 +121,17 @@ class OnlineBuffer(torch.utils.data.Dataset):
             "frame_index": {"dtype": np.dtype("int64"), "shape": (buffer_capacity,)},
             "episode_index": {"dtype": np.dtype("int64"), "shape": (buffer_capacity,)},
             "timestamp": {"dtype": np.dtype("float64"), "shape": (buffer_capacity,)},
-            **{
-                k: {"dtype": np.dtype("float32"), "shape": (buffer_capacity, *v)}
-                for k, v in data_shapes.items()
-            },
         }
-        return data_spec
+        for k, v in data_spec.items():
+            complete_data_spec[k] = {"dtype": v["dtype"], "shape": (buffer_capacity, *v["shape"])}
+        return complete_data_spec
 
     def add_data(self, data: dict[str, np.ndarray]):
         """Add new data to the buffer, which could potentially mean shifting old data out.
+
+        The new data should contain all the frames (in order) of any number of episodes. The indices should
+        start from 0 (note to the developer: this can easily be generalized). See the `rollout` and
+        `eval_policy` functions in `eval.py` for more information on how the data is constructed.
 
         Shift the incoming data index and episode_index to continue on from the last frame. Note that this
         will be done in place!

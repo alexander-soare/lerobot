@@ -23,6 +23,7 @@ from pprint import pformat
 from threading import Lock
 
 import hydra
+import numpy as np
 import torch
 from deepdiff import DeepDiff
 from omegaconf import DictConfig, ListConfig, OmegaConf
@@ -241,8 +242,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
 
     init_logging()
 
-    # Check if settings are compatible with online training.
-    if isinstance(cfg.dataset_repo_id, ListConfig):
+    if cfg.training.online_steps > 0 and isinstance(cfg.dataset_repo_id, ListConfig):
         raise NotImplementedError("Online training with LeRobotMultiDataset is not implemented.")
 
     # If we are resuming a run, we need to check that a checkpoint exists in the log directory, and we need
@@ -443,28 +443,29 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
     # Create an env dedicated to online episodes collection from policy rollout.
     online_env = make_env(cfg, n_envs=cfg.training.online_rollout_batch_size)
     resolve_delta_timestamps(cfg)
-    if not cfg.resume:
-        online_dataset = OnlineBuffer(
-            logger.log_dir / "online_buffer",
-            data_shapes={
-                **policy.config.input_shapes,
-                **policy.config.output_shapes,
-                "next.reward": (),
-                "next.done": (),
-                "next.success": (),
-            },
-            buffer_capacity=cfg.training.online_buffer_capacity,
-            fps=online_env.unwrapped.metadata["render_fps"],
-            delta_timestamps=cfg.training.delta_timestamps,
-        )
-    else:
+    online_buffer_path = logger.log_dir / "online_buffer"
+    if cfg.resume and not online_buffer_path.exists():
         # If we are resuming a run, we default to the data shapes and buffer capacity from the saved online
         # buffer.
-        online_dataset = OnlineBuffer(
-            logger.log_dir / "online_buffer",
-            fps=online_env.unwrapped.metadata["render_fps"],
-            delta_timestamps=cfg.training.delta_timestamps,
+        logging.warning(
+            "When online training is resumed, we load the latest online buffer from the prior run, "
+            "and this might not coincide with the state of the buffer as it was at the moment the checkpoint "
+            "was made. This is because the online buffer is updated on disk during training, independently "
+            "of our explicit checkpointing mechansims."
         )
+    online_dataset = OnlineBuffer(
+        online_buffer_path,
+        data_spec={
+            **{k: {"shape": v, "dtype": np.dtype("float32")} for k, v in policy.config.input_shapes.items()},
+            **{k: {"shape": v, "dtype": np.dtype("float32")} for k, v in policy.config.output_shapes.items()},
+            "next.reward": {"shape": (), "dtype": np.dtype("float32")},
+            "next.done": {"shape": (), "dtype": np.dtype("?")},
+            "next.success": {"shape": (), "dtype": np.dtype("?")},
+        },
+        buffer_capacity=cfg.training.online_buffer_capacity,
+        fps=online_env.unwrapped.metadata["render_fps"],
+        delta_timestamps=cfg.training.delta_timestamps,
+    )
 
     # If we are doing online rollouts asynchronously, deepcopy the policy to use for online rollouts (this
     # makes it possible to do online rollouts in parallel with training updates).
@@ -484,7 +485,6 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
     sampler = torch.utils.data.WeightedRandomSampler(
         weights, num_samples=len(concat_dataset), replacement=True
     )
-    # TODO(now): Add a way of verifying that num_workers == 0 if async rollouts.
     dataloader = torch.utils.data.DataLoader(
         concat_dataset,
         batch_size=cfg.training.batch_size,
@@ -498,6 +498,8 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
     # Lock and thread pool executor for asynchronous online rollouts. When asynchronous mode is disabled,
     # these are still used but effectively do nothing.
     lock = Lock()
+    # Note: 1 worker because we only ever want to run one set of online rollouts at a time. Batch
+    # parallelization of rollouts is handled within the job.
     executor = ThreadPoolExecutor(max_workers=1)
 
     online_step = 0
@@ -507,6 +509,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
     # online rollout option.
     await_update_online_buffer_s = 0
     rollout_start_seed = cfg.training.online_env_seed
+
     while True:
         if online_step == cfg.training.online_steps:
             break
@@ -531,8 +534,6 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
                     start_seed=(
                         rollout_start_seed := (rollout_start_seed + cfg.training.batch_size) % 1000000
                     ),
-                    enable_progbar=True,
-                    enable_inner_progbar=True,
                 )
             online_rollout_s = time.perf_counter() - start_rollout_time
 
@@ -551,9 +552,11 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
             return online_rollout_s, update_online_buffer_s
 
         future = executor.submit(sample_trajectory_and_update_buffer)
+        # If we aren't doing async rollouts, or if we haven't yet gotten enough examples in our buffer, wait
+        # here until the rollout and buffer update is done, before proceeding to the policy update steps.
         if (
-            len(online_dataset) <= cfg.training.online_buffer_seed_size
-            or not cfg.training.do_online_rollout_async
+            not cfg.training.do_online_rollout_async
+            or len(online_dataset) <= cfg.training.online_buffer_seed_size
         ):
             online_rollout_s, update_online_buffer_s = future.result()
 
@@ -601,6 +604,8 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
             step += 1
             online_step += 1
 
+        # If we're doing async rollouts, we should now wait until we've completed them before proceeding
+        # to do the next batch of rollouts.
         if future.running():
             start = time.perf_counter()
             online_rollout_s, update_online_buffer_s = future.result()
